@@ -124,7 +124,13 @@ pub trait ConfigurableADIProxy: ADIProxy {
 pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
 pub const CLIENT_INFO_HEADER: &str =
     "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>";
+/// Default directory-services ID used for ordinary anisette (GSA / developer-services)
+/// provisioning. This is what every standard anisette client expects.
 pub const DS_ID: i64 = -2;
+/// Directory-services ID for the App Store's AMD (type-2) machine provisioning. The store's
+/// `_accountIDForType:` returns -1, so its `end_provisioning` only succeeds when the identity
+/// was provisioned with this ds_id. Clients opt into it per request (see `set_ds_id`).
+pub const STORE_DS_ID: i64 = -1;
 pub const IDENTIFIER_LENGTH: usize = 16;
 pub type Identifier = [u8; IDENTIFIER_LENGTH];
 
@@ -287,12 +293,22 @@ impl dyn ADIProxy {
 
 pub struct ADIProxyAnisetteProvider<ProxyType: ADIProxy + 'static> {
     adi_proxy: ProxyType,
+    /// Directory-services ID used when requesting the machine OTP and when deciding whether the
+    /// machine is provisioned. Defaults to [`DS_ID`] (-2); set to [`STORE_DS_ID`] (-1) for the
+    /// App Store AMD flow via [`set_ds_id`].
+    ds_id: i64,
 }
 
 impl<ProxyType: ADIProxy + 'static> ADIProxyAnisetteProvider<ProxyType> {
     /// If you use this method, you are expected to set the identifier yourself.
     pub fn without_identifier(adi_proxy: ProxyType) -> Result<ADIProxyAnisetteProvider<ProxyType>, ADIError> {
-        Ok(ADIProxyAnisetteProvider { adi_proxy })
+        Ok(ADIProxyAnisetteProvider { adi_proxy, ds_id: DS_ID })
+    }
+
+    /// Set the directory-services ID used for `request_otp` / `is_machine_provisioned`.
+    /// Use [`DS_ID`] for ordinary anisette or [`STORE_DS_ID`] for the App Store AMD flow.
+    pub fn set_ds_id(&mut self, ds_id: i64) {
+        self.ds_id = ds_id;
     }
 
     pub fn new(
@@ -324,7 +340,7 @@ impl<ProxyType: ADIProxy + 'static> ADIProxyAnisetteProvider<ProxyType> {
         adi_proxy
             .set_local_user_uuid(hex::encode(local_user_uuid_hasher.finalize()).to_uppercase()); // 64 uppercase character hex
 
-        Ok(ADIProxyAnisetteProvider { adi_proxy })
+        Ok(ADIProxyAnisetteProvider { adi_proxy, ds_id: DS_ID })
     }
 
     pub fn adi_proxy(&mut self) -> &mut ProxyType {
@@ -341,13 +357,17 @@ impl<ProxyType: ADIProxy + 'static> AnisetteHeadersProvider
         &mut self,
         skip_provisioning: bool,
     ) -> Result<HashMap<String, String>, AnisetteError> {
+        let ds_id = self.ds_id;
         let adi_proxy = &mut self.adi_proxy as &mut dyn ADIProxy;
 
-        if !adi_proxy.is_machine_provisioned(DS_ID) && !skip_provisioning {
+        if !adi_proxy.is_machine_provisioned(ds_id) && !skip_provisioning {
+            // provision_device() auto-provisions against the default DS_ID only; the custom-ds_id
+            // (store) path always arrives here with skip_provisioning=true and an already-provisioned
+            // adi.pb, so this branch is never taken for ds_id != DS_ID.
             adi_proxy.provision_device().await?;
         }
 
-        let machine_data = adi_proxy.request_otp(DS_ID)?;
+        let machine_data = adi_proxy.request_otp(ds_id)?;
 
         let mut headers = HashMap::new();
         headers.insert(
